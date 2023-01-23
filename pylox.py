@@ -145,6 +145,7 @@ def make_syntax_tree_node(base_class, name, *attrs):
         if len(values) != len(attrs):
             message = f"{name}.__init__() take {len(attrs)} positional arguments but {len(values)} were given"
             raise TypeError(message)
+
         for attr, value in zip(attrs, values):
             setattr(self, attr, value)
 
@@ -153,8 +154,10 @@ def make_syntax_tree_node(base_class, name, *attrs):
     def accept(self, visitor):
         return getattr(visitor, visit_fn_name)(self)
 
-    subclass = type(name, (base_class,), {
-                    "__init__": __init__, "accept": accept})
+    subclass = type(
+        name, (base_class,),
+        {"__init__": __init__, "accept": accept})
+
     setattr(base_class, name, subclass)
 
     def visit(self, expr):
@@ -180,14 +183,18 @@ class Stmt:
 
 
 # Expr subclasses
+make_syntax_tree_node(Expr, "Assign", "name", "value")
 make_syntax_tree_node(Expr, "Binary", "left", "operator", "right")
 make_syntax_tree_node(Expr, "Grouping", "expression")
 make_syntax_tree_node(Expr, "Literal", "value")
 make_syntax_tree_node(Expr, "Unary", "operator", "right")
+make_syntax_tree_node(Expr, "Variable", "name")
 
 # Stmt subclasses
+make_syntax_tree_node(Stmt, "Block", "statements")
 make_syntax_tree_node(Stmt, "Expression", "expression")
 make_syntax_tree_node(Stmt, "Print", "expression")
+make_syntax_tree_node(Stmt, "Var", "name", "initializer")
 
 
 class AstPrinter(Expr.Visitor):
@@ -224,26 +231,61 @@ class Parser:
     def parse(self):
         statements = []
         while not self.at_end():
-            statements.append(self.statement())
+            statements.append(self.declaration())
         return statements
+
+    def declaration(self):
+        try:
+            if self.match("VAR"):
+                return self.var_declaration()
+            return self.statement()
+        except Parser.Error as error:
+            self.synchronize()
+            return None
 
     def statement(self):
         if self.match("PRINT"):
             return self.print_statement()
+        if self.match("LEFT_BRACE"):
+            return Stmt.Block(self.block())
         return self.expression_statement()
 
-    def print_statement(self):
-        expression = self.expression()
-        self.consume("SEMICOLON", "Expected ';' after expression.")
-        return Stmt.Print(expression)
+    def block(self):
+        statements = []
+        while self.peek().type != "RIGHT_BRACE" and not self.at_end():
+            statements.append(self.declaration())
+        self.consume("RIGHT_BRACE", "Expected '}' after block.")
+        return statements
 
     def expression_statement(self):
         expression = self.expression()
         self.consume("SEMICOLON", "Expected ';' after expression.")
         return Stmt.Expression(expression)
 
+    def print_statement(self):
+        expression = self.expression()
+        self.consume("SEMICOLON", "Expected ';' after expression.")
+        return Stmt.Print(expression)
+
+    def var_declaration(self):
+        name = self.consume("IDENTIFIER", "Expected identifier.")
+        initializer = None
+        if self.match("EQUAL"):
+            initializer = self.expression()
+        self.consume("SEMICOLON", "Expected ';' after variable declaration.")
+        return Stmt.Var(name, initializer)
+
     def expression(self):
-        return self.equality()
+        return self.assignment()
+
+    def assignment(self):
+        expr = self.equality()
+        if equals := self.match("EQUAL"):
+            value = self.assignment()
+            if isinstance(expr, Expr.Variable):
+                return Expr.Assign(expr.name, value)
+            self.error(equals, "Invalid assignment target.")
+        return expr
 
     def equality(self):
         expr = self.comparison()
@@ -287,7 +329,8 @@ class Parser:
             expr = self.expression()
             self.consume("RIGHT_PAREN", "Expected ')' after expression.")
             return Expr.Grouping(expr)
-
+        if token := self.match("IDENTIFIER"):
+            return Expr.Variable(token)
         raise self.error(self.peek(), "Expected expression.")
 
     def synchronize(self):
@@ -301,8 +344,9 @@ class Parser:
             self.advance()
 
     def consume(self, token_type, message):
-        if not self.match(token_type):
-            raise self.error(self.peek(), message)
+        if token := self.match(token_type):
+            return token
+        raise self.error(self.peek(), message)
 
     def match(self, *token_types):
         if self.peek().type in token_types:
@@ -329,11 +373,40 @@ class Parser:
         return Parser.Error()
 
 
+class Environment:
+    def __init__(self, enclosing=None):
+        self.values = {}
+        self.enclosing = enclosing
+
+    def define(self, name, value):
+        self.values[name.lexeme] = value
+
+    def assign(self, name, value):
+        if name.lexeme in self.values:
+            self.values[name.lexeme] = value
+            return
+        if self.enclosing:
+            self.enclosing.assign(name, value)
+        raise Interpreter.Error(
+            name, f"Undefined variable '{name.lexeme}'.")
+
+    def get(self, name):
+        if name.lexeme in self.values:
+            return self.values[name.lexeme]
+        if self.enclosing:
+            return self.enclosing.get(name)
+        raise Interpreter.Error(
+            name, f"Undefined variable '{name.lexeme}'.")
+
+
 class Interpreter(Expr.Visitor, Stmt.Visitor):
     class Error(RuntimeError):
         def __init__(self, token, message):
             self.token = token
             self.message = message
+
+    def __init__(self):
+        self.environment = Environment()
 
     def interpret(self, stmts):
         try:
@@ -356,12 +429,34 @@ class Interpreter(Expr.Visitor, Stmt.Visitor):
     def execute(self, stmt):
         return stmt.accept(self)
 
+    def execute_block(self, statements, environment):
+        try:
+            self.environment = environment
+            for statement in statements:
+                self.execute(statement)
+        finally:
+            self.environment = environment.enclosing
+
+    def visit_block_stmt(self, stmt):
+        self.execute_block(stmt.statements, Environment(self.environment))
+
     def visit_expression_stmt(self, stmt):
         self.evaluate(stmt.expression)
 
     def visit_print_stmt(self, stmt):
         value = self.evaluate(stmt.expression)
         print(self.stringify(value))
+
+    def visit_var_stmt(self, stmt):
+        value = None
+        if stmt.initializer:
+            value = self.evaluate(stmt.initializer)
+        self.environment.define(stmt.name, value)
+
+    def visit_assign_expr(self, expr):
+        value = self.evaluate(expr.value)
+        self.environment.assign(expr.name, value)
+        return value
 
     def visit_binary_expr(self, expr):
         left = self.evaluate(expr.left)
@@ -419,6 +514,9 @@ class Interpreter(Expr.Visitor, Stmt.Visitor):
                 return -right
             case _: return None
 
+    def visit_variable_expr(self, expr):
+        return self.environment.get(expr.name)
+
     def is_truthy(self, object):
         if object is None:
             return False
@@ -468,6 +566,8 @@ class PyLox:
             except EOFError:
                 print()
                 break
+            PyLox.had_error = False
+            PyLox.had_runtime_error = False
             PyLox.run(line)
 
     @staticmethod
