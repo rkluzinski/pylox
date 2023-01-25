@@ -20,6 +20,7 @@ class Scanner:
         "class",
         "else",
         "false",
+        "for",
         "fun",
         "if",
         "nil",
@@ -187,37 +188,17 @@ make_syntax_tree_node(Expr, "Assign", "name", "value")
 make_syntax_tree_node(Expr, "Binary", "left", "operator", "right")
 make_syntax_tree_node(Expr, "Grouping", "expression")
 make_syntax_tree_node(Expr, "Literal", "value")
+make_syntax_tree_node(Expr, "Logical", "left", "operator", "right")
 make_syntax_tree_node(Expr, "Unary", "operator", "right")
 make_syntax_tree_node(Expr, "Variable", "name")
 
 # Stmt subclasses
 make_syntax_tree_node(Stmt, "Block", "statements")
 make_syntax_tree_node(Stmt, "Expression", "expression")
+make_syntax_tree_node(Stmt, "If", "condition", "then_branch", "else_branch")
 make_syntax_tree_node(Stmt, "Print", "expression")
 make_syntax_tree_node(Stmt, "Var", "name", "initializer")
-
-
-class AstPrinter(Expr.Visitor):
-    def print(self, expr):
-        return expr.accept(self)
-
-    def visit_binary_expr(self, binary):
-        return self.parenthesize(binary.operator.lexeme, binary.left, binary.right)
-
-    def visit_grouping_expr(self, grouping):
-        return self.parenthesize("group", grouping.expression)
-
-    def visit_literal_expr(self, literal):
-        if literal.value is None:
-            return "nil"
-        return str(literal.value)
-
-    def visit_unary_expr(self, unary):
-        return self.parenthesize(unary.operator.lexeme, unary.right)
-
-    def parenthesize(self, name, *exprs):
-        args = " ".join([expr.accept(self) for expr in exprs])
-        return f"({name} {args})"
+make_syntax_tree_node(Stmt, "While", "condition", "body")
 
 
 class Parser:
@@ -244,10 +225,16 @@ class Parser:
             return None
 
     def statement(self):
+        if self.match("FOR"):
+            return self.for_statement()
+        if self.match("IF"):
+            return self.if_statement()
         if self.match("PRINT"):
             return self.print_statement()
         if self.match("LEFT_BRACE"):
             return Stmt.Block(self.block())
+        if self.match("WHILE"):
+            return self.while_statement()
         return self.expression_statement()
 
     def block(self):
@@ -256,6 +243,50 @@ class Parser:
             statements.append(self.declaration())
         self.consume("RIGHT_BRACE", "Expected '}' after block.")
         return statements
+
+    def for_statement(self):
+        self.consume("LEFT_PAREN", "Expected '(' after for.")
+
+        initializer = None
+        if self.match("VAR"):
+            initializer = self.var_declaration()
+        elif not self.match("SEMICOLON"):
+            initializer = self.expression_statement()
+
+        condition = None
+        if not self.match("SEMICOLON"):
+            condition = self.expression()
+        self.consume("SEMICOLON", "Expected ';' after loop condition.")
+
+        increment = None
+        if not self.match("SEMICOLON"):
+            increment = self.expression()
+
+        self.consume("RIGHT_PAREN", "Expected ')' after for clauses.")
+        body = self.statement()
+
+        if increment:
+            body = Stmt.Block([body, increment])
+
+        if not condition:
+            condition = Expr.Literal(True)
+
+        body = Stmt.While(condition, body)
+
+        if initializer:
+            body = Stmt.Block([initializer, body])
+
+        return body
+
+    def if_statement(self):
+        self.consume("LEFT_PAREN", "Expected '(' after if.")
+        condition = self.expression()
+        self.consume("RIGHT_PAREN", "Expected ')' after condition.")
+        then_branch = self.statement()
+        else_branch = None
+        if self.match("ELSE"):
+            else_branch = self.statement()
+        return Stmt.If(condition, then_branch, else_branch)
 
     def expression_statement(self):
         expression = self.expression()
@@ -275,16 +306,35 @@ class Parser:
         self.consume("SEMICOLON", "Expected ';' after variable declaration.")
         return Stmt.Var(name, initializer)
 
+    def while_statement(self):
+        self.consume("LEFT_PAREN", "Expected '(' after while.")
+        condition = self.expression()
+        self.consume("RIGHT_PAREN", "Expected ')' after condition.")
+        body = self.statement()
+        return Stmt.While(condition, body)
+
     def expression(self):
         return self.assignment()
 
     def assignment(self):
-        expr = self.equality()
+        expr = self.logic_or()
         if equals := self.match("EQUAL"):
             value = self.assignment()
             if isinstance(expr, Expr.Variable):
                 return Expr.Assign(expr.name, value)
             self.error(equals, "Invalid assignment target.")
+        return expr
+
+    def logic_or(self):
+        expr = self.logic_and()
+        while operator := self.match("OR"):
+            expr = Expr.Logical(expr, operator, self.logic_and())
+        return expr
+
+    def logic_and(self):
+        expr = self.equality()
+        while operator := self.match("AND"):
+            expr = Expr.Logical(expr, operator, self.equality())
         return expr
 
     def equality(self):
@@ -387,6 +437,7 @@ class Environment:
             return
         if self.enclosing:
             self.enclosing.assign(name, value)
+            return
         raise Interpreter.Error(
             name, f"Undefined variable '{name.lexeme}'.")
 
@@ -443,6 +494,12 @@ class Interpreter(Expr.Visitor, Stmt.Visitor):
     def visit_expression_stmt(self, stmt):
         self.evaluate(stmt.expression)
 
+    def visit_if_stmt(self, stmt):
+        if self.is_truthy(self.evaluate(stmt.condition)):
+            self.execute(stmt.then_branch)
+        elif stmt.else_branch:
+            self.execute(stmt.else_branch)
+
     def visit_print_stmt(self, stmt):
         value = self.evaluate(stmt.expression)
         print(self.stringify(value))
@@ -452,6 +509,10 @@ class Interpreter(Expr.Visitor, Stmt.Visitor):
         if stmt.initializer:
             value = self.evaluate(stmt.initializer)
         self.environment.define(stmt.name, value)
+
+    def visit_while_stmt(self, stmt):
+        while self.is_truthy(self.evaluate(stmt.condition)):
+            self.execute(stmt.body)
 
     def visit_assign_expr(self, expr):
         value = self.evaluate(expr.value)
@@ -505,6 +566,16 @@ class Interpreter(Expr.Visitor, Stmt.Visitor):
     def visit_literal_expr(self, expr):
         return expr.value
 
+    def visit_logical_expr(self, expr):
+        left = self.evaluate(expr.left)
+        if expr.operator.type == "OR":
+            if self.is_truthy(left):
+                return left
+        else:
+            if not self.is_truthy(left):
+                return left
+        return self.evaluate(expr.right)
+
     def visit_unary_expr(self, expr):
         right = self.evaluate(expr.right)
         match expr.operator.type:
@@ -520,7 +591,7 @@ class Interpreter(Expr.Visitor, Stmt.Visitor):
     def is_truthy(self, object):
         if object is None:
             return False
-        if object is bool:
+        if isinstance(object, bool):
             return object
         return True
 
