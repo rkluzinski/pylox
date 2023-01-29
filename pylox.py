@@ -187,14 +187,18 @@ class Stmt:
 make_syntax_tree_node(Expr, "Assign", "name", "value")
 make_syntax_tree_node(Expr, "Binary", "left", "operator", "right")
 make_syntax_tree_node(Expr, "Call", "callee", "paren", "arguments")
+make_syntax_tree_node(Expr, "Get", "object", "name")
 make_syntax_tree_node(Expr, "Grouping", "expression")
 make_syntax_tree_node(Expr, "Literal", "value")
 make_syntax_tree_node(Expr, "Logical", "left", "operator", "right")
+make_syntax_tree_node(Expr, "Set", "object", "name", "value")
+make_syntax_tree_node(Expr, "This", "keyword")
 make_syntax_tree_node(Expr, "Unary", "operator", "right")
 make_syntax_tree_node(Expr, "Variable", "name")
 
 # Stmt subclasses
 make_syntax_tree_node(Stmt, "Block", "statements")
+make_syntax_tree_node(Stmt, "Class", "name", "methods")
 make_syntax_tree_node(Stmt, "Expression", "expression")
 make_syntax_tree_node(Stmt, "Function", "name", "params", "body")
 make_syntax_tree_node(Stmt, "If", "condition", "then_branch", "else_branch")
@@ -220,6 +224,8 @@ class Parser:
 
     def declaration(self):
         try:
+            if self.match("CLASS"):
+                return self.class_declaration()
             if self.match("FUN"):
                 return self.function("function")
             if self.match("VAR"):
@@ -228,6 +234,17 @@ class Parser:
         except Parser.Error as error:
             self.synchronize()
             return None
+
+    def class_declaration(self):
+        name = self.consume("IDENTIFIER", "Expected class name.")
+        self.consume("LEFT_BRACE", "Expected '{' before class bpdy.")
+
+        methods = []
+        while not self.at_end() and self.peek().type != "RIGHT_BRACE":
+            methods.append(self.function("method"))
+
+        self.consume("RIGHT_BRACE", "Expected '}' after class body.")
+        return Stmt.Class(name, methods)
 
     def function(self, kind):
         name = self.consume("IDENTIFIER", f"Expected {kind} name.")
@@ -350,6 +367,8 @@ class Parser:
             value = self.assignment()
             if isinstance(expr, Expr.Variable):
                 return Expr.Assign(expr.name, value)
+            elif isinstance(expr, Expr.Get):
+                return Expr.Set(expr.object, expr.name, value)
             self.error(equals, "Invalid assignment target.")
         return expr
 
@@ -396,8 +415,15 @@ class Parser:
 
     def call(self):
         expr = self.primary()
-        while self.match("LEFT_PAREN"):
-            expr = self.finish_call(expr)
+        while True:
+            if self.match("LEFT_PAREN"):
+                expr = self.finish_call(expr)
+            elif self.match("DOT"):
+                name = self.consume(
+                    "IDENTIFIER", "Expected property name after '.'.")
+                expr = Expr.Get(expr, name)
+            else:
+                break
         return expr
 
     def finish_call(self, callee):
@@ -425,6 +451,8 @@ class Parser:
             expr = self.expression()
             self.consume("RIGHT_PAREN", "Expected ')' after expression.")
             return Expr.Grouping(expr)
+        if keyword := self.match("THIS"):
+            return Expr.This(keyword)
         if token := self.match("IDENTIFIER"):
             return Expr.Variable(token)
         raise self.error(self.peek(), "Expected expression.")
@@ -469,6 +497,155 @@ class Parser:
         return Parser.Error()
 
 
+class Resolver(Expr.Visitor, Stmt.Visitor):
+    def __init__(self, interpreter):
+        self.interpreter = interpreter
+        self.scopes = []
+        self.current_function = "NONE"
+        self.current_class = "NONE"
+
+    def resolve(self, expr_or_stmt):
+        expr_or_stmt.accept(self)
+
+    def visit_block_stmt(self, stmt):
+        self.begin_scope()
+        for statement in stmt.statements:
+            self.resolve(statement)
+        self.end_scope()
+
+    def visit_class_stmt(self, stmt):
+        enclosing_class = self.current_class
+        self.current_class = "CLASS"
+        self.declare(stmt.name)
+        self.begin_scope()
+        self.scopes[-1]["this"] = True
+        for method in stmt.methods:
+            kind = "METHOD"
+            if method.name.lexeme == "init":
+                kind = "INITIALIZER"
+            self.resolve_function(method, kind)
+        self.define(stmt.name)
+        self.end_scope()
+        self.current_class = enclosing_class
+
+    def visit_expression_stmt(self, stmt):
+        self.resolve(stmt.expression)
+
+    def visit_function_stmt(self, stmt):
+        self.declare(stmt.name)
+        self.define(stmt.name)
+        self.resolve_function(stmt, "FUNCTION")
+
+    def visit_if_stmt(self, stmt):
+        self.resolve(stmt.condition)
+        self.resolve(stmt.then_branch)
+        if stmt.else_branch:
+            self.resolve(stmt.else_branch)
+
+    def visit_print_stmt(self, stmt):
+        self.resolve(stmt.expression)
+
+    def visit_return_stmt(self, stmt):
+        if self.current_function == "NONE":
+            PyLox.error(stmt.keyword.line, "Can't return from top-level code.")
+        if stmt.value:
+            if self.current_function == "INITIALIZER":
+                PyLox.error(stmt.keyword.line,
+                            "Can't return a value from an initializer.")
+            self.resolve(stmt.value)
+
+    def visit_var_stmt(self, stmt):
+        self.declare(stmt.name)
+        if (stmt.initializer):
+            self.resolve(stmt.initializer)
+        self.define(stmt.name)
+
+    def visit_while_stmt(self, stmt):
+        self.resolve(stmt.condition)
+        self.resolve(stmt.body)
+
+    def visit_assign_expr(self, expr):
+        self.resolve(expr.value)
+        self.resolve_local(expr, expr.name)
+
+    def visit_binary_expr(self, expr):
+        self.resolve(expr.left)
+        self.resolve(expr.right)
+
+    def visit_call_expr(self, expr):
+        self.resolve(expr.callee)
+        for argument in expr.arguments:
+            self.resolve(argument)
+
+    def visit_get_expr(self, expr):
+        self.resolve(expr.object)
+
+    def visit_grouping_expr(self, expr):
+        self.resolve(expr.expression)
+
+    def visit_literal_expr(self, expr):
+        pass
+
+    def visit_logical_expr(self, expr):
+        self.resolve(expr.left)
+        self.resolve(expr.right)
+
+    def visit_set_expr(self, expr):
+        self.resolve(expr.value)
+        self.resolve(expr.object)
+
+    def visit_this_expr(self, expr):
+        if self.current_class == "NONE":
+            PyLox.error(expr.keyword.line,
+                        "Can't use 'this' outside of a class.")
+            return None
+        self.resolve_local(expr, expr.keyword)
+
+    def visit_unary_expr(self, expr):
+        self.resolve(expr.right)
+
+    def visit_variable_expr(self, expr):
+        if self.scopes and self.scopes[-1][expr.name.lexeme] == False:
+            PyLox.Error(
+                expr.name.line, "Can't read local variable in its own initializer.")
+        self.resolve_local(expr, expr.name)
+
+    def begin_scope(self):
+        self.scopes.append({})
+
+    def end_scope(self):
+        self.scopes.pop()
+
+    def declare(self, name):
+        if self.scopes:
+            if name.lexeme in self.scopes[-1]:
+                PyLox.error(
+                    name.line, "Already a variable with this name in this scope.")
+            self.scopes[-1][name.lexeme] = False
+
+    def define(self, name):
+        if self.scopes:
+            self.scopes[-1][name.lexeme] = True
+
+    def resolve_function(self, function, kind):
+        enclosing = self.current_function
+        self.current_function = kind
+        self.begin_scope()
+        for param in function.params:
+            self.declare(param)
+            self.define(param)
+        for stmt in function.body:
+            self.resolve(stmt)
+        self.end_scope()
+        self.current_function = enclosing
+
+    def resolve_local(self, expr, name):
+        for i, scope in enumerate(reversed(self.scopes)):
+            if name.lexeme in scope:
+                self.interpreter.resolve(expr, i)
+                break
+
+
 class Environment:
     def __init__(self, enclosing=None):
         self.values = {}
@@ -495,6 +672,19 @@ class Environment:
         raise Interpreter.Error(
             name, f"Undefined variable '{name.lexeme}'.")
 
+    def assign_at(self, distance, name, value):
+        self.ancestor(distance).values[name] = value
+        return value
+
+    def get_at(self, distance, name):
+        return self.ancestor(distance).values[name]
+
+    def ancestor(self, distance):
+        environment = self
+        for i in range(distance):
+            environment = environment.enclosing
+        return environment
+
 
 class LoxCallable:
     def arity(self):
@@ -505,12 +695,18 @@ class LoxCallable:
 
 
 class LoxFunction(LoxCallable):
-    def __init__(self, declaration, closure):
+    def __init__(self, declaration, closure, is_initializer):
         self.declaration = declaration
         self.closure = closure
+        self.is_initializer = is_initializer
 
     def arity(self):
         return len(self.declaration.params)
+
+    def bind(self, instance):
+        environment = Environment(self.closure)
+        environment.define("this", instance)
+        return LoxFunction(self.declaration, environment, self.is_initializer)
 
     def call(self, interpreter, arguments):
         environment = Environment(self.closure)
@@ -519,10 +715,58 @@ class LoxFunction(LoxCallable):
         try:
             interpreter.execute_block(self.declaration.body, environment)
         except Interpreter.Return as returnValue:
+            if self.is_initializer:
+                return self.closure.get_at(0, "this")
             return returnValue.value
+
+        if self.is_initializer:
+            return self.closure.get_at(0, "this")
 
     def __str__(self):
         return f"<fn {self.declaration.name.lexeme}>"
+
+
+class LoxClass(LoxCallable):
+    def __init__(self, name, methods):
+        self.name = name
+        self.methods = methods
+
+    def arity(self):
+        if initializer := self.find_method("init"):
+            return initializer.arity()
+        return 0
+
+    def call(self, interpreter, arguments):
+        instance = LoxInstance(self)
+        if initializer := self.find_method("init"):
+            initializer.bind(instance).call(interpreter, arguments)
+        return instance
+
+    def find_method(self, name):
+        return self.methods.get(name, None)
+
+    def __str__(self):
+        return self.name
+
+
+class LoxInstance:
+    def __init__(self, klass):
+        self.klass = klass
+        self.fields = {}
+
+    def get(self, name):
+        if name.lexeme in self.fields:
+            return self.fields[name.lexeme]
+        if method := self.klass.find_method(name.lexeme):
+            return method.bind(self)
+        raise Interpreter.Error(
+            name, f"Undefined property '{name.lexeme}'.")
+
+    def set(self, name, value):
+        self.fields[name.lexeme] = value
+
+    def __str__(self):
+        return f"{self.klass.name} instance"
 
 
 class Interpreter(Expr.Visitor, Stmt.Visitor):
@@ -538,6 +782,7 @@ class Interpreter(Expr.Visitor, Stmt.Visitor):
     def __init__(self):
         self.globals = Environment()
         self.environment = self.globals
+        self.locals = {}
 
         def make_native_function(name, arity, call):
             return type(name, (LoxCallable,), {
@@ -570,6 +815,9 @@ class Interpreter(Expr.Visitor, Stmt.Visitor):
     def execute(self, stmt):
         return stmt.accept(self)
 
+    def resolve(self, expr, depth):
+        self.locals[expr] = depth
+
     def execute_block(self, statements, environment):
         previous = self.environment
         try:
@@ -582,11 +830,20 @@ class Interpreter(Expr.Visitor, Stmt.Visitor):
     def visit_block_stmt(self, stmt):
         self.execute_block(stmt.statements, Environment(self.environment))
 
+    def visit_class_stmt(self, stmt):
+        self.environment.define(stmt.name.lexeme, None)
+        methods = {
+            method.name.lexeme: LoxFunction(
+                method, self.environment, method.name.lexeme == "init")
+            for method in stmt.methods}
+        klass = LoxClass(stmt.name.lexeme, methods)
+        self.environment.assign(stmt.name, klass)
+
     def visit_expression_stmt(self, stmt):
         self.evaluate(stmt.expression)
 
     def visit_function_stmt(self, stmt):
-        func = LoxFunction(stmt, self.environment)
+        func = LoxFunction(stmt, self.environment, False)
         self.environment.define(stmt.name.lexeme, func)
 
     def visit_if_stmt(self, stmt):
@@ -617,7 +874,10 @@ class Interpreter(Expr.Visitor, Stmt.Visitor):
 
     def visit_assign_expr(self, expr):
         value = self.evaluate(expr.value)
-        self.environment.assign(expr.name, value)
+        if distance := self.locals.get():
+            self.environment.assign_at(distance, expr.name.lexeme, value)
+        else:
+            self.globals.assign(expr.name)
         return value
 
     def visit_binary_expr(self, expr):
@@ -663,14 +923,21 @@ class Interpreter(Expr.Visitor, Stmt.Visitor):
 
     def visit_call_expr(self, expr):
         callee = self.evaluate(expr.callee)
-        arguments = list(map(self.evaluate, expr.arguments))
         if not isinstance(callee, LoxCallable):
             raise Interpreter.Error(
                 expr.paren, "Can only call functions and classes.")
+        arguments = list(map(self.evaluate, expr.arguments))
         if len(arguments) != callee.arity():
             raise Interpreter.Error(
-                expr.paren, f"Expected {callee.arity()} arguments but got {arguments.size()}.")
+                expr.paren, f"Expected {callee.arity()} arguments but got {len(arguments)}.")
         return callee.call(self, arguments)
+
+    def visit_get_expr(self, expr):
+        obj = self.evaluate(expr.object)
+        if isinstance(obj, LoxInstance):
+            return obj.get(expr.name)
+        raise Interpreter.Error(
+            expr.name, "Only instances have properties.")
 
     def visit_grouping_expr(self, expr):
         return self.evaluate(expr.expression)
@@ -688,6 +955,18 @@ class Interpreter(Expr.Visitor, Stmt.Visitor):
                 return left
         return self.evaluate(expr.right)
 
+    def visit_set_expr(self, expr):
+        obj = self.evaluate(expr.object)
+        if not isinstance(obj, LoxInstance):
+            raise Interpreter.Error(
+                expr.name, "Only instances have fields.")
+        value = self.evaluate(expr.value)
+        obj.set(expr.name, value)
+        return value
+
+    def visit_this_expr(self, expr):
+        return self.lookup_variable(expr.keyword, expr)
+
     def visit_unary_expr(self, expr):
         right = self.evaluate(expr.right)
         match expr.operator.type:
@@ -698,7 +977,12 @@ class Interpreter(Expr.Visitor, Stmt.Visitor):
             case _: return None
 
     def visit_variable_expr(self, expr):
-        return self.environment.get(expr.name)
+        return self.lookup_variable(expr.name, expr)
+
+    def lookup_variable(self, name, expr):
+        if expr in self.locals:
+            return self.environment.get_at(self.locals[expr], name.lexeme)
+        return self.globals.get(name)
 
     def is_truthy(self, object):
         if object is None:
@@ -760,6 +1044,13 @@ class PyLox:
 
         parser = Parser(tokens)
         statements = parser.parse()
+
+        if PyLox.had_error:
+            return
+
+        resolver = Resolver(PyLox.interpreter)
+        for statement in statements:
+            resolver.resolve(statement)
 
         if PyLox.had_error:
             return
