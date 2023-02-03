@@ -192,13 +192,14 @@ make_syntax_tree_node(Expr, "Grouping", "expression")
 make_syntax_tree_node(Expr, "Literal", "value")
 make_syntax_tree_node(Expr, "Logical", "left", "operator", "right")
 make_syntax_tree_node(Expr, "Set", "object", "name", "value")
+make_syntax_tree_node(Expr, "Super", "keyword", "method")
 make_syntax_tree_node(Expr, "This", "keyword")
 make_syntax_tree_node(Expr, "Unary", "operator", "right")
 make_syntax_tree_node(Expr, "Variable", "name")
 
 # Stmt subclasses
 make_syntax_tree_node(Stmt, "Block", "statements")
-make_syntax_tree_node(Stmt, "Class", "name", "methods")
+make_syntax_tree_node(Stmt, "Class", "name", "superclass", "methods")
 make_syntax_tree_node(Stmt, "Expression", "expression")
 make_syntax_tree_node(Stmt, "Function", "name", "params", "body")
 make_syntax_tree_node(Stmt, "If", "condition", "then_branch", "else_branch")
@@ -237,6 +238,12 @@ class Parser:
 
     def class_declaration(self):
         name = self.consume("IDENTIFIER", "Expected class name.")
+
+        superclass = None
+        if self.match("LESS"):
+            superclass = Expr.Variable(self.consume(
+                "IDENTIFIER", "Expected superclass name."))
+
         self.consume("LEFT_BRACE", "Expected '{' before class bpdy.")
 
         methods = []
@@ -244,7 +251,7 @@ class Parser:
             methods.append(self.function("method"))
 
         self.consume("RIGHT_BRACE", "Expected '}' after class body.")
-        return Stmt.Class(name, methods)
+        return Stmt.Class(name, superclass, methods)
 
     def function(self, kind):
         name = self.consume("IDENTIFIER", f"Expected {kind} name.")
@@ -260,6 +267,7 @@ class Parser:
                         self.peek(), "Can't have more than 255 parameters.")
                 params.append(self.consume(
                     "IDENTIFIER", "Expected parameter name."))
+
         self.consume("RIGHT_PAREN", "Expected ')' after parameters.")
         self.consume("LEFT_BRACE", f"Expect '{'{'}' before {kind} body.")
         return Stmt.Function(name, params, self.block())
@@ -451,6 +459,11 @@ class Parser:
             expr = self.expression()
             self.consume("RIGHT_PAREN", "Expected ')' after expression.")
             return Expr.Grouping(expr)
+        if keyword := self.match("SUPER"):
+            self.consume("DOT", "Expected '.' after 'super'.")
+            method = self.consume(
+                "IDENTIFIER", "Expected superclass method name.")
+            return Expr.Super(keyword, method)
         if keyword := self.match("THIS"):
             return Expr.This(keyword)
         if token := self.match("IDENTIFIER"):
@@ -516,7 +529,19 @@ class Resolver(Expr.Visitor, Stmt.Visitor):
     def visit_class_stmt(self, stmt):
         enclosing_class = self.current_class
         self.current_class = "CLASS"
+
         self.declare(stmt.name)
+        if stmt.superclass:
+            self.current_class = "SUBCLASS"
+            if stmt.name.lexeme == stmt.superclass.name.lexeme:
+                PyLox.error(stmt.superclass.name.line,
+                            "A class can't inherit from itself.")
+            self.resolve(stmt.superclass)
+
+        if stmt.superclass:
+            self.begin_scope()
+            self.scopes[-1]["super"] = True
+
         self.begin_scope()
         self.scopes[-1]["this"] = True
         for method in stmt.methods:
@@ -526,6 +551,10 @@ class Resolver(Expr.Visitor, Stmt.Visitor):
             self.resolve_function(method, kind)
         self.define(stmt.name)
         self.end_scope()
+
+        if stmt.superclass:
+            self.end_scope()
+
         self.current_class = enclosing_class
 
     def visit_expression_stmt(self, stmt):
@@ -593,6 +622,15 @@ class Resolver(Expr.Visitor, Stmt.Visitor):
     def visit_set_expr(self, expr):
         self.resolve(expr.value)
         self.resolve(expr.object)
+
+    def visit_super_expr(self, expr):
+        if self.current_class == "NONE":
+            PyLox.error(expr.keyword.line,
+                        "Can't use 'super' outside of a class.")
+        elif self.current_class == "SUBCLASS":
+            PyLox.error(expr.keyword.line,
+                        "Can't use 'super' in a class with no superclass.")
+        self.resolve_local(expr, expr.keyword)
 
     def visit_this_expr(self, expr):
         if self.current_class == "NONE":
@@ -727,8 +765,9 @@ class LoxFunction(LoxCallable):
 
 
 class LoxClass(LoxCallable):
-    def __init__(self, name, methods):
+    def __init__(self, name, superclass, methods):
         self.name = name
+        self.superclass = superclass
         self.methods = methods
 
     def arity(self):
@@ -743,7 +782,11 @@ class LoxClass(LoxCallable):
         return instance
 
     def find_method(self, name):
-        return self.methods.get(name, None)
+        if method := self.methods.get(name, None):
+            return method
+        if self.superclass:
+            return self.superclass.find_method(name)
+        return None
 
     def __str__(self):
         return self.name
@@ -831,12 +874,29 @@ class Interpreter(Expr.Visitor, Stmt.Visitor):
         self.execute_block(stmt.statements, Environment(self.environment))
 
     def visit_class_stmt(self, stmt):
+        superclass = None
+        if stmt.superclass:
+            superclass = self.evaluate(stmt.superclass)
+            if not isinstance(superclass, LoxClass):
+                raise Interpreter.Error(
+                    stmt.superclass.name, "Superclass must be a class.")
+
         self.environment.define(stmt.name.lexeme, None)
+
+        if superclass:
+            self.environment = Environment(self.environment)
+            self.environment.define("super", superclass)
+
         methods = {
             method.name.lexeme: LoxFunction(
                 method, self.environment, method.name.lexeme == "init")
             for method in stmt.methods}
-        klass = LoxClass(stmt.name.lexeme, methods)
+
+        klass = LoxClass(stmt.name.lexeme, superclass, methods)
+
+        if superclass:
+            self.environment = self.environment.enclosing
+
         self.environment.assign(stmt.name, klass)
 
     def visit_expression_stmt(self, stmt):
@@ -963,6 +1023,19 @@ class Interpreter(Expr.Visitor, Stmt.Visitor):
         value = self.evaluate(expr.value)
         obj.set(expr.name, value)
         return value
+
+    def visit_super_expr(self, expr):
+        distance = self.locals.get(expr)
+        superclass = self.environment.get_at(distance, "super")
+        instance = self.environment.get_at(distance - 1, "this")
+
+        method = superclass.find_method(expr.method.lexeme)
+
+        if not method:
+            raise Interpreter.Error(
+                expr.method, f"Undefined property '{expr.method.lexeme}'.")
+
+        return method.bind(instance)
 
     def visit_this_expr(self, expr):
         return self.lookup_variable(expr.keyword, expr)
