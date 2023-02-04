@@ -513,7 +513,7 @@ class Parser:
 class Resolver(Expr.Visitor, Stmt.Visitor):
     def __init__(self, interpreter):
         self.interpreter = interpreter
-        self.scopes = []
+        self.scopes = [{}]
         self.current_function = "NONE"
         self.current_class = "NONE"
 
@@ -643,7 +643,7 @@ class Resolver(Expr.Visitor, Stmt.Visitor):
         self.resolve(expr.right)
 
     def visit_variable_expr(self, expr):
-        if self.scopes and self.scopes[-1][expr.name.lexeme] == False:
+        if self.scopes and self.scopes[-1].get(expr.name.lexeme, None) == False:
             PyLox.Error(
                 expr.name.line, "Can't read local variable in its own initializer.")
         self.resolve_local(expr, expr.name)
@@ -835,7 +835,7 @@ class Interpreter(Expr.Visitor, Stmt.Visitor):
             })()
 
         self.globals.define("clock", make_native_function(
-            "Clock", 0, lambda _1, _2, _3: time.time() * 1000.0))
+            "Clock", 0, lambda _1, _2, _3: time.time()))
 
     def interpret(self, stmts):
         try:
